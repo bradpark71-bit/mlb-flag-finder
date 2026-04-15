@@ -416,6 +416,112 @@ def load_all(today_str: str, today_sheet: str) -> dict:
     return results
 
 
+# ── PLAYS JSON LOADER ──────────────────────────────────────────────────────────
+def load_plays_json(files, date_str, tier="T1"):
+    suffix = "" if tier == "T1" else "_T2"
+    fname = f"plays_{date_str}{suffix}.json"
+    match = [f for f in files if f["name"] == fname]
+    if not match:
+        return None
+    try:
+        return read_json_from_drive(match[0]["id"])
+    except:
+        return None
+
+
+def render_plays_json_tab(files, today_str, current_window):
+    """Render Chat 2 pre-computed plays JSON — source of truth tab."""
+    t1_data = load_plays_json(files, today_str, "T1")
+    t2_data = load_plays_json(files, today_str, "T2")
+
+    if not t1_data and not t2_data:
+        st.markdown(no_plays_html(
+            "NO PLAYS FILE YET",
+            f"Chat 2 hasn't written plays_{today_str}.json or plays_{today_str}_T2.json to Drive yet."
+        ), unsafe_allow_html=True)
+        return
+
+    for tier, data in [("T1", t1_data), ("T2", t2_data)]:
+        if not data:
+            st.markdown(f'<div style="background:#12121f; border:1px dashed #546e7a40; border-radius:6px; padding:10px 16px; margin-bottom:12px; font-family:\'Share Tech Mono\',monospace; font-size:0.76em; color:#546e7a;">{tier}: no plays file written yet</div>', unsafe_allow_html=True)
+            continue
+
+        accent = "#00e5ff" if tier == "T1" else "#ffab00"
+        plays    = data.get("plays", [])
+        flags    = data.get("flags", [])
+        kills    = data.get("kills", [])
+        bifurcs  = data.get("bifurcations", [])
+        preflags = data.get("t2_preflags", [])
+        shadows  = data.get("shadow_fires", [])
+        meta     = data.get("meta", {})
+        total_units = sum(p.get("units", 0) for p in plays)
+        capture = meta.get("capture_time", "—")[:16].replace("T", " ")
+
+        st.markdown(section_title_html(
+            f"{'🎯' if plays else '—'} CHAT 2 — {tier}  |  {len(plays)} play{'s' if len(plays) != 1 else ''}  ·  {total_units:.1f}u  ·  {meta.get('engine_version','—')}",
+            accent
+        ), unsafe_allow_html=True)
+
+        st.markdown(kpi_html([
+            ("Plays", len(plays), "green" if plays else "muted"),
+            ("Total Units", f"{total_units:.1f}u", "amber" if total_units > 0 else "muted"),
+            ("Flags", len(flags), "amber" if flags else "muted"),
+            ("Kills", len(kills), "red" if kills else "muted"),
+            ("Captured", capture, "muted"),
+        ]), unsafe_allow_html=True)
+
+        if plays:
+            for p in plays:
+                sigs_html = ""
+                for s in p.get("key_signals", []):
+                    sigs_html += f'<div><span style="color:#4caf50;">✅ {s}</span></div>'
+                for f in p.get("flags", []):
+                    sigs_html += f'<div><span style="color:#f44336;">❌ {f}</span></div>'
+                sp_line = p.get("sp", "")
+                if sp_line:
+                    sigs_html += f'<div><span style="color:#888;">📐 {sp_line}</span></div>'
+                st.markdown(play_card_html(
+                    matchup=p.get("game", "—"),
+                    time_venue=f"{p.get('time_hst','—')} HST",
+                    tier=p.get("level", "LEAN"),
+                    play_line=p.get("play", "—"),
+                    units=f"→ {p.get('units', 0)}u",
+                    meta=f"Engine {p.get('engine','?')}  ·  Score +{p.get('score',0):.2f}  ·  {p.get('plr_id','—')}",
+                    flags_html=sigs_html,
+                    accent=accent,
+                ), unsafe_allow_html=True)
+        else:
+            st.markdown(no_plays_html(f"NO {tier} PLAYS", "All games below threshold."), unsafe_allow_html=True)
+
+        if kills:
+            st.markdown(section_title_html("🔴 KILLS", "#f44336"), unsafe_allow_html=True)
+            for k in kills:
+                st.markdown(f'<div style="background:#12121f; border:1px solid #f4433640; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#f44336;">🔴 <strong>{k.get("game","—")}</strong> — {k.get("note","—")}</div>', unsafe_allow_html=True)
+
+        if flags:
+            st.markdown(section_title_html("🚩 FLAGS", "#ffab00"), unsafe_allow_html=True)
+            for f in flags:
+                sev_color = "#f44336" if f.get("severity") in ("WARN", "AMBER") else "#546e7a"
+                st.markdown(f'<div style="background:#12121f; border:1px solid {sev_color}40; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:{sev_color};">🚩 <strong>{f.get("id","—")}</strong> [{f.get("severity","INFO")}] — {f.get("note","—")}</div>', unsafe_allow_html=True)
+
+        if bifurcs:
+            st.markdown(section_title_html("⚡ BIFURCATIONS", "#f44336"), unsafe_allow_html=True)
+            for b in bifurcs:
+                st.markdown(f'<div style="background:#12121f; border:1px solid #f4433640; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#f44336;">⚡ <strong>{b.get("game","—")}</strong> — {b.get("note","—")}</div>', unsafe_allow_html=True)
+
+        if tier == "T1" and preflags:
+            st.markdown(section_title_html(f"⭐ T2 PRE-FLAGS ({len(preflags)})", "#ce93d8"), unsafe_allow_html=True)
+            for pf in preflags:
+                st.markdown(f'<div style="background:#12121f; border:1px solid #ce93d840; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#ce93d8;">⭐ <strong>{pf.get("game","—")}</strong>  EA +{pf.get("ea_score",0):.2f}  —  {pf.get("note","—")}</div>', unsafe_allow_html=True)
+
+        if shadows:
+            st.markdown(section_title_html("🌡️ SHADOW FIRES", "#546e7a"), unsafe_allow_html=True)
+            for s in shadows:
+                st.markdown(f'<div style="background:#12121f; border:1px solid #546e7a40; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#546e7a;">🌡️ <strong>{s.get("signal","—")}</strong> — {s.get("game","—")} — {s.get("note","—")}</div>', unsafe_allow_html=True)
+
+        st.markdown("<hr style='border-color:#1a1a2e; margin:20px 0;'>", unsafe_allow_html=True)
+
+
 # ── MAIN ────────────────────────────────────────────────────────────────────────
 def main():
     now_hst = datetime.now(HST)
@@ -476,6 +582,7 @@ def main():
     # ── TABS ──
     tabs = st.tabs([
         "📡 TODAY'S PLAYS",
+        "🎯 CHAT 2 PLAYS",
         "📋 FULL SLATE",
         "⚡ SHARP MONEY",
         "📊 KALSHI DEPTH",
@@ -485,7 +592,15 @@ def main():
     ])
 
     # ═══════════════════════════════════════════════════════
-    # TAB 0 — TODAY'S PLAYS
+    # TAB 1 — CHAT 2 PLAYS (pre-computed JSON)
+    # ═══════════════════════════════════════════════════════
+    with tabs[1]:
+        folder_id_for_plays = get_folder_id(DRIVE_FOLDER_NAME)
+        files_for_plays = list_folder_files(folder_id_for_plays) if folder_id_for_plays else []
+        render_plays_json_tab(files_for_plays, today_str, current_window)
+
+    # ═══════════════════════════════════════════════════════
+    # TAB 0 — TODAY'S PLAYS (dashboard scoring)
     # ═══════════════════════════════════════════════════════
     with tabs[0]:
         if df_out is None:
@@ -620,9 +735,9 @@ def main():
             """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 1 — FULL SLATE
+    # TAB 2 — FULL SLATE
     # ═══════════════════════════════════════════════════════
-    with tabs[1]:
+    with tabs[2]:
         if df_out is None:
             st.error("Daily Outlook not loaded.")
         else:
@@ -651,9 +766,9 @@ def main():
             st.dataframe(df_show, use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 2 — SHARP MONEY
+    # TAB 3 — SHARP MONEY
     # ═══════════════════════════════════════════════════════
-    with tabs[2]:
+    with tabs[3]:
         if not trade_flows:
             st.markdown(alert_html("⚠️ NO TRADE FLOW DATA", f"No trade_flow_{today_str}_*.json found in Drive folder."), unsafe_allow_html=True)
         else:
@@ -715,9 +830,9 @@ def main():
                     """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 3 — KALSHI DEPTH
+    # TAB 4 — KALSHI DEPTH
     # ═══════════════════════════════════════════════════════
-    with tabs[3]:
+    with tabs[4]:
         if kd_data is None:
             st.markdown(alert_html("⚠️ NO KALSHI DEPTH DATA", f"No kalshi_depth_{today_str}_close/open.json found."), unsafe_allow_html=True)
         else:
@@ -776,9 +891,9 @@ def main():
                 """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 4 — GOD MODE
+    # TAB 5 — GOD MODE
     # ═══════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         if gm_data is None:
             st.markdown(alert_html("⚠️ GOD MODE NOT LOADED", f"No MLB_God_Mode_{today_str}*.xlsx found in Drive folder."), unsafe_allow_html=True)
         else:
@@ -789,9 +904,9 @@ def main():
                     st.dataframe(gm_data[sname], use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 5 — WX PRESSURE
+    # TAB 6 — WX PRESSURE
     # ═══════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         if px_data is None:
             st.markdown(alert_html("⚠️ NO PRESSURE DATA", f"No game_day_pressure_{today_str}.json found."), unsafe_allow_html=True)
         else:
@@ -828,9 +943,9 @@ def main():
                 """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 6 — FUTURES
+    # TAB 7 — FUTURES
     # ═══════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         if not futures_file_id:
             st.markdown(alert_html("⚠️ FUTURES TRACKER NOT FOUND", "MLB_Futures_Tracker.xlsx not found in Drive folder."), unsafe_allow_html=True)
         else:
