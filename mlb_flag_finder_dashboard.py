@@ -424,16 +424,13 @@ def main():
     current_window = "T1" if now_hst.hour < 13 else "T2"
 
     # ── TOP BAR ──
-    c1, c2, c3 = st.columns([4, 1, 1])
-    with c1:
-        st.markdown(header_html(today_str, current_window), unsafe_allow_html=True)
-    with c2:
-        st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(header_html(today_str, current_window), unsafe_allow_html=True)
+    col_w, col_r, _ = st.columns([1, 1, 4])
+    with col_w:
         window_override = st.selectbox("Window", ["Auto", "T1", "T2"], label_visibility="collapsed")
         if window_override != "Auto":
             current_window = window_override
-    with c3:
-        st.markdown("<br>", unsafe_allow_html=True)
+    with col_r:
         if st.button("🔄 Refresh"):
             st.cache_data.clear()
             st.rerun()
