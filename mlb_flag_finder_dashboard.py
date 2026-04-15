@@ -1,19 +1,23 @@
 """
-⚡ MLB Flag Finder Dashboard
-Matches play card design language: dark navy, Orbitron/Share Tech Mono,
-cyan = T1, amber = T2, green = plays, red = alerts.
+⚡ MLB Flag Finder Dashboard — Streamlit Cloud Edition
+Pulls all data files from Google Drive "MLB 2026" folder via service account.
+Local path references replaced with Drive API calls.
 """
-
 import streamlit as st
 import pandas as pd
 import json
-import glob
+import io
 import os
 from datetime import datetime
 import pytz
 
+# ── GOOGLE DRIVE IMPORTS ───────────────────────────────────────────────────────
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-DATA_DIR = os.path.expanduser("~/Desktop/MLB/Data")
+DRIVE_FOLDER_NAME = "MLB 2026"   # Exact folder name shared with service account
 HST = pytz.timezone("Pacific/Honolulu")
 
 st.set_page_config(
@@ -23,12 +27,105 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ── GOOGLE DRIVE AUTH ──────────────────────────────────────────────────────────
+@st.cache_resource
+def get_drive_service():
+    """Build Drive service from Streamlit secrets (service account JSON)."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+@st.cache_data(ttl=300)
+def get_folder_id(folder_name: str) -> str | None:
+    """Find the Drive folder ID by name."""
+    service = get_drive_service()
+    resp = service.files().list(
+        q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id, name)",
+        pageSize=5,
+    ).execute()
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+
+@st.cache_data(ttl=300)
+def list_folder_files(folder_id: str) -> list[dict]:
+    """Return all files in a Drive folder (non-trashed)."""
+    service = get_drive_service()
+    results = []
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType, modifiedTime)",
+            pageSize=100,
+            pageToken=page_token,
+        ).execute()
+        results.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def find_file(files: list[dict], name: str) -> dict | None:
+    """Exact filename match."""
+    for f in files:
+        if f["name"] == name:
+            return f
+    return None
+
+
+def find_file_contains(files: list[dict], substring: str) -> dict | None:
+    """First file whose name contains substring."""
+    for f in files:
+        if substring in f["name"]:
+            return f
+    return None
+
+
+def find_files_contains(files: list[dict], substring: str) -> list[dict]:
+    """All files whose name contains substring, sorted desc by name."""
+    matches = [f for f in files if substring in f["name"]]
+    return sorted(matches, key=lambda x: x["name"], reverse=True)
+
+
+def download_bytes(file_id: str) -> bytes:
+    """Download a file from Drive as raw bytes."""
+    service = get_drive_service()
+    request = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    return buf.read()
+
+
+def read_excel_from_drive(file_id: str, sheet_name=0) -> pd.DataFrame:
+    raw = download_bytes(file_id)
+    return pd.read_excel(io.BytesIO(raw), sheet_name=sheet_name)
+
+
+def read_excel_file_from_drive(file_id: str) -> pd.ExcelFile:
+    raw = download_bytes(file_id)
+    return pd.ExcelFile(io.BytesIO(raw))
+
+
+def read_json_from_drive(file_id: str) -> dict:
+    raw = download_bytes(file_id)
+    return json.loads(raw.decode("utf-8"))
+
+
 # ── CSS — matches play card exactly ────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
-
-/* GLOBAL */
 html, body, [class*="css"] {
     font-family: 'Share Tech Mono', monospace !important;
     background-color: #0a0a12 !important;
@@ -36,8 +133,6 @@ html, body, [class*="css"] {
 }
 .stApp { background: linear-gradient(135deg, #0a0a12 0%, #1a1a2e 100%) !important; }
 .block-container { padding: 1.5rem 2rem !important; max-width: 1200px; }
-
-/* Grid overlay like play cards */
 .stApp::before {
     content: '';
     position: fixed;
@@ -49,95 +144,56 @@ html, body, [class*="css"] {
     pointer-events: none;
     z-index: 0;
 }
-
-/* TABS */
 .stTabs [data-baseweb="tab-list"] {
-    gap: 8px;
-    background: transparent;
-    border-bottom: 2px solid #00e5ff40;
-    padding-bottom: 4px;
+    gap: 8px; background: transparent;
+    border-bottom: 2px solid #00e5ff40; padding-bottom: 4px;
 }
 .stTabs [data-baseweb="tab"] {
-    background: #12121f;
-    border: 1px solid #1a1a2e;
-    border-radius: 4px 4px 0 0;
-    padding: 8px 20px;
+    background: #12121f; border: 1px solid #1a1a2e;
+    border-radius: 4px 4px 0 0; padding: 8px 20px;
     font-family: 'Orbitron', sans-serif !important;
-    font-size: 0.7em;
-    font-weight: 700;
-    color: #546e7a;
-    letter-spacing: 1px;
+    font-size: 0.7em; font-weight: 700; color: #546e7a; letter-spacing: 1px;
 }
 .stTabs [aria-selected="true"] {
-    background: #0d0d18 !important;
-    color: #00e5ff !important;
-    border-color: #00e5ff !important;
-    border-bottom-color: #0a0a12 !important;
+    background: #0d0d18 !important; color: #00e5ff !important;
+    border-color: #00e5ff !important; border-bottom-color: #0a0a12 !important;
 }
-.stTabs [data-baseweb="tab-panel"] {
-    background: transparent;
-    padding-top: 1rem;
-}
-
-/* METRICS */
+.stTabs [data-baseweb="tab-panel"] { background: transparent; padding-top: 1rem; }
 [data-testid="metric-container"] {
-    background: #12121f !important;
-    border: 1px solid #1a1a2e !important;
-    border-radius: 6px !important;
-    padding: 12px !important;
+    background: #12121f !important; border: 1px solid #1a1a2e !important;
+    border-radius: 6px !important; padding: 12px !important;
 }
 [data-testid="metric-container"] label {
     font-family: 'Share Tech Mono', monospace !important;
-    font-size: 0.65em !important;
-    color: #888 !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
+    font-size: 0.65em !important; color: #888 !important;
+    text-transform: uppercase; letter-spacing: 1px;
 }
 [data-testid="metric-container"] [data-testid="stMetricValue"] {
     font-family: 'Orbitron', sans-serif !important;
-    font-size: 1.6em !important;
-    color: #00e5ff;
+    font-size: 1.6em !important; color: #00e5ff;
 }
-
-/* BUTTONS */
 .stButton button {
-    background: #12121f !important;
-    border: 1px solid #00e5ff40 !important;
-    color: #00e5ff !important;
-    font-family: 'Orbitron', sans-serif !important;
-    font-size: 0.7em !important;
-    font-weight: 700 !important;
-    letter-spacing: 1px !important;
-    border-radius: 4px !important;
+    background: #12121f !important; border: 1px solid #00e5ff40 !important;
+    color: #00e5ff !important; font-family: 'Orbitron', sans-serif !important;
+    font-size: 0.7em !important; font-weight: 700 !important;
+    letter-spacing: 1px !important; border-radius: 4px !important;
     padding: 6px 16px !important;
 }
 .stButton button:hover {
     border-color: #00e5ff !important;
     box-shadow: 0 0 12px rgba(0,229,255,0.2) !important;
 }
-
-/* DATAFRAME */
 .stDataFrame { border: 1px solid #1a1a2e !important; border-radius: 6px !important; }
 [data-testid="stDataFrame"] th {
-    background: #0d0d18 !important;
-    color: #888 !important;
+    background: #0d0d18 !important; color: #888 !important;
     font-family: 'Share Tech Mono', monospace !important;
-    font-size: 0.72em !important;
-    text-transform: uppercase;
+    font-size: 0.72em !important; text-transform: uppercase;
 }
-
-/* DIVIDER */
 hr { border-color: #1a1a2e !important; }
-
-/* SELECT/INPUT */
 .stSelectbox select, .stSelectbox div[data-baseweb="select"] {
-    background: #12121f !important;
-    border-color: #1a1a2e !important;
-    color: #e0e0ff !important;
-    font-family: 'Share Tech Mono', monospace !important;
+    background: #12121f !important; border-color: #1a1a2e !important;
+    color: #e0e0ff !important; font-family: 'Share Tech Mono', monospace !important;
 }
-
-/* SCROLLBAR */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: #0a0a12; }
 ::-webkit-scrollbar-thumb { background: #1a1a2e; border-radius: 3px; }
@@ -146,7 +202,6 @@ hr { border-color: #1a1a2e !important; }
 """, unsafe_allow_html=True)
 
 # ── HTML COMPONENTS ─────────────────────────────────────────────────────────────
-
 def header_html(today_str, window, version="v1.1g6a"):
     accent = "#00e5ff" if window == "T1" else "#ffab00"
     badge_class = "t1" if window == "T1" else "t2"
@@ -188,22 +243,30 @@ def alert_html(label, detail, color="#ffab00"):
 """
 
 def kpi_html(items):
-    """items = list of (label, value, color_class) where color_class is cyan|green|amber|muted|red|purple"""
     color_map = {
         "cyan": "#00e5ff", "green": "#4caf50", "amber": "#ffab00",
         "muted": "#546e7a", "red": "#f44336", "purple": "#ce93d8", "white": "#fff"
     }
-    cols = "".join([f"""<div style="background:#12121f; border:1px solid #1a1a2e; border-radius:6px; padding:12px; text-align:center;"><div style="font-size:0.68em; color:#888; text-transform:uppercase; letter-spacing:1px; font-family:'Share Tech Mono',monospace;">{label}</div><div style="font-family:'Orbitron',sans-serif; font-size:1.5em; font-weight:700; color:{color_map.get(clr,'#aaa')};">{val}</div></div>""" for label, val, clr in items])
+    cols = "".join([
+        f"""<div style="background:#12121f; border:1px solid #1a1a2e; border-radius:6px; padding:12px; text-align:center;">
+<div style="font-size:0.68em; color:#888; text-transform:uppercase; letter-spacing:1px; font-family:'Share Tech Mono',monospace;">{label}</div>
+<div style="font-family:'Orbitron',sans-serif; font-size:1.5em; font-weight:700; color:{color_map.get(clr,'#aaa')};">{val}</div>
+</div>"""
+        for label, val, clr in items
+    ])
     return f"""<div style="display:grid; grid-template-columns:repeat({len(items)},1fr); gap:10px; margin-bottom:20px;">{cols}</div>"""
 
 def no_plays_html(msg, detail=""):
-    return f"""<div style="background:#12121f; border:1px dashed #546e7a40; border-radius:8px; padding:22px; text-align:center; margin-bottom:18px;"><div style="font-family:'Orbitron',sans-serif; font-size:1.05em; color:#546e7a; font-weight:700; letter-spacing:2px;">{msg}</div><div style="font-size:0.78em; color:#546e7a; margin-top:6px; font-family:'Share Tech Mono',monospace;">{detail}</div></div>"""
+    return f"""<div style="background:#12121f; border:1px dashed #546e7a40; border-radius:8px; padding:22px; text-align:center; margin-bottom:18px;">
+<div style="font-family:'Orbitron',sans-serif; font-size:1.05em; color:#546e7a; font-weight:700; letter-spacing:2px;">{msg}</div>
+<div style="font-size:0.78em; color:#546e7a; margin-top:6px; font-family:'Share Tech Mono',monospace;">{detail}</div>
+</div>"""
 
 def play_card_html(matchup, time_venue, tier, play_line, units, meta, flags_html, note="", accent="#ffab00"):
     tier_colors = {
-        "LEAN": ("#80d8ff", "rgba(128,216,255,0.12)", "#80d8ff40"),
-        "STRONG": ("#4caf50", "rgba(76,175,80,0.15)", "#4caf5040"),
-        "ELITE": ("#00e5ff", "rgba(0,229,255,0.12)", "#00e5ff40"),
+        "LEAN":   ("#80d8ff", "rgba(128,216,255,0.12)", "#80d8ff40"),
+        "STRONG": ("#4caf50", "rgba(76,175,80,0.15)",   "#4caf5040"),
+        "ELITE":  ("#00e5ff", "rgba(0,229,255,0.12)",   "#00e5ff40"),
     }
     tc, tbg, tborder = tier_colors.get(tier.upper(), ("#888", "rgba(136,136,136,0.1)", "#88888840"))
     note_html = f'<div style="font-size:0.74em; color:#546e7a; padding:8px 16px; background:#0a0a12; border-top:1px solid #1a1a2e20; font-style:italic; font-family:\'Share Tech Mono\',monospace;">{note}</div>' if note else ""
@@ -225,47 +288,6 @@ def play_card_html(matchup, time_venue, tier, play_line, units, meta, flags_html
   {note_html}
 </div>"""
 
-def sig_block_html(matchup, time_venue, ea_verdict, eb_verdict, rows_html, eng_row_html, note="", highlight=False):
-    border = "#00e5ff40" if highlight else "#1a1a2e"
-    shadow = "box-shadow:0 0 14px rgba(0,229,255,0.1);" if highlight else ""
-    note_div = f'<div style="font-size:0.73em; color:#546e7a; padding:6px 14px; background:#0a0a12; border-top:1px solid #1a1a2e10; font-style:italic; font-family:\'Share Tech Mono\',monospace;">{note}</div>' if note else ""
-    def verdict_badge(v):
-        v_upper = v.upper()
-        if "PASS" in v_upper: style = "background:rgba(84,110,122,0.12); border:1px solid #546e7a; color:#546e7a;"
-        elif "PLAY" in v_upper or "LEAN" in v_upper or "STRONG" in v_upper: style = "background:rgba(0,229,255,0.12); border:1px solid #00e5ff; color:#00e5ff;"
-        elif "KILLED" in v_upper: style = "background:rgba(244,67,54,0.1); border:1px solid #f44336; color:#f44336;"
-        elif "WATCH" in v_upper or "CLOSEST" in v_upper: style = "background:rgba(255,171,0,0.12); border:1px solid #ffab00; color:#ffab00;"
-        else: style = "background:rgba(84,110,122,0.12); border:1px solid #546e7a; color:#546e7a;"
-        return f'<span style="font-family:\'Orbitron\',sans-serif; font-size:0.65em; font-weight:700; padding:3px 10px; border-radius:4px; letter-spacing:1px; {style}">{v}</span>'
-    return f"""
-<div style="background:#12121f; border:1px solid {border}; border-radius:8px; margin-bottom:10px;
-     overflow:hidden; {shadow}">
-  <div style="padding:10px 14px; background:#0d0d18; display:flex; align-items:center; gap:8px;
-       flex-wrap:wrap; border-bottom:1px solid #1a1a2e;">
-    <span style="font-family:'Orbitron',sans-serif; font-size:1.0em; font-weight:700; color:#fff;">{matchup}</span>
-    <span style="font-size:0.72em; color:#546e7a; font-family:'Share Tech Mono',monospace;">{time_venue}</span>
-    {verdict_badge(ea_verdict)}
-    {verdict_badge(eb_verdict)}
-  </div>
-  <div style="overflow-x:auto;">
-  <table style="width:100%; border-collapse:collapse; font-size:0.76em; font-family:'Share Tech Mono',monospace;">
-    <thead><tr style="background:#0d0d18;">
-      <th style="padding:5px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em;">Signal</th>
-      <th style="padding:5px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em;">Market Type</th>
-      <th style="padding:5px 10px; text-align:right; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em;">Kalshi Prob</th>
-      <th style="padding:5px 10px; text-align:right; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em;">Volume</th>
-      <th style="padding:5px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em;">Direction</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-  </div>
-  <div style="padding:6px 14px; background:#0a0a12; border-top:1px solid #1a1a2e; font-size:0.76em;
-       display:flex; gap:12px; flex-wrap:wrap; align-items:center; font-family:'Share Tech Mono',monospace;">
-    {eng_row_html}
-  </div>
-  {note_div}
-</div>"""
-
 def section_title_html(text, color="#00e5ff"):
     return f"""<div style="font-family:'Orbitron',sans-serif; font-size:0.88em; font-weight:700; color:{color}; margin:22px 0 10px; padding-bottom:5px; border-bottom:1px solid {color}20; letter-spacing:1px;">{text}</div>"""
 
@@ -283,81 +305,7 @@ def sharp_row_html(title, mtype, direction, signal_type, divergence, big_money, 
   <td style="padding:5px 10px; color:#888; text-align:right;">${dollars:,.0f}</td>
 </tr>"""
 
-
-# ── DATA LOADERS ────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def load_all(today_str, today_sheet):
-    results = {}
-
-    # Daily Outlook
-    path = os.path.join(DATA_DIR, "MLB_Daily_Outlook.xlsx")
-    try:
-        xl = pd.ExcelFile(path)
-        sheet = today_sheet if today_sheet in xl.sheet_names else xl.sheet_names[0]
-        df = pd.read_excel(path, sheet_name=sheet).dropna(subset=["away_team"])
-        results["outlook"] = (df, None, sheet)
-    except Exception as e:
-        results["outlook"] = (None, str(e), None)
-
-    # Trade flow — both files, sorted desc
-    tf_pattern = os.path.join(DATA_DIR, f"trade_flow_{today_str}_*.json")
-    tf_files = sorted(glob.glob(tf_pattern), reverse=True)
-    results["trade_flows"] = []
-    for f in tf_files:
-        try:
-            with open(f) as fh:
-                results["trade_flows"].append((json.load(fh), os.path.basename(f)))
-        except:
-            pass
-
-    # Kalshi depth
-    for suffix in ["close", "open"]:
-        kd_path = os.path.join(DATA_DIR, f"kalshi_depth_{today_str}_{suffix}.json")
-        if os.path.exists(kd_path):
-            try:
-                with open(kd_path) as fh:
-                    results["kalshi_depth"] = (json.load(fh), os.path.basename(kd_path))
-                break
-            except:
-                pass
-    if "kalshi_depth" not in results:
-        results["kalshi_depth"] = (None, None)
-
-    # God Mode — prefer PM
-    for pattern in [f"*MLB_God_Mode_{today_str}_PM.xlsx", f"*MLB_God_Mode_{today_str}.xlsx"]:
-        files = sorted(glob.glob(os.path.join(DATA_DIR, pattern)))
-        if files:
-            try:
-                xl_gm = pd.ExcelFile(files[0])
-                gm = {sn: pd.read_excel(files[0], sheet_name=sn) for sn in xl_gm.sheet_names}
-                results["god_mode"] = (gm, os.path.basename(files[0]))
-                break
-            except:
-                pass
-    if "god_mode" not in results:
-        results["god_mode"] = (None, None)
-
-    # Pressure
-    px_path = os.path.join(DATA_DIR, f"game_day_pressure_{today_str}.json")
-    if os.path.exists(px_path):
-        try:
-            with open(px_path) as fh:
-                results["pressure"] = json.load(fh)
-        except:
-            results["pressure"] = None
-    else:
-        results["pressure"] = None
-
-    # Master DB
-    mdb_path = os.path.join(DATA_DIR, "MLB_Master_DB.xlsx")
-    try:
-        results["master_db"] = pd.read_excel(mdb_path)
-    except:
-        results["master_db"] = None
-
-    return results
-
-
+# ── HELPERS ─────────────────────────────────────────────────────────────────────
 def classify_window(game_time_hst):
     try:
         hour = int(str(game_time_hst).split(":")[0])
@@ -373,9 +321,99 @@ def fmt_ml(val):
         return "—"
 
 def safe(val, default="—"):
-    if pd.isna(val) if not isinstance(val, str) else False:
+    if not isinstance(val, str) and pd.isna(val):
         return default
     return val if str(val) not in ("nan", "None", "") else default
+
+# ── DATA LOADERS (Drive-backed) ─────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_all(today_str: str, today_sheet: str) -> dict:
+    results = {}
+
+    # ── Get folder listing ──
+    folder_id = get_folder_id(DRIVE_FOLDER_NAME)
+    if not folder_id:
+        results["_folder_error"] = f"Drive folder '{DRIVE_FOLDER_NAME}' not found. Check folder sharing."
+        return results
+
+    files = list_folder_files(folder_id)
+    results["_file_count"] = len(files)
+
+    # ── Daily Outlook ──
+    f_out = find_file(files, "MLB_Daily_Outlook.xlsx")
+    if f_out:
+        try:
+            xl = read_excel_file_from_drive(f_out["id"])
+            sheet = today_sheet if today_sheet in xl.sheet_names else xl.sheet_names[0]
+            df = pd.read_excel(io.BytesIO(download_bytes(f_out["id"])), sheet_name=sheet).dropna(subset=["away_team"])
+            results["outlook"] = (df, None, sheet)
+        except Exception as e:
+            results["outlook"] = (None, str(e), None)
+    else:
+        results["outlook"] = (None, "MLB_Daily_Outlook.xlsx not found in Drive folder.", None)
+
+    # ── Trade Flow ──
+    tf_files = find_files_contains(files, f"trade_flow_{today_str}_")
+    results["trade_flows"] = []
+    for f in tf_files:
+        try:
+            results["trade_flows"].append((read_json_from_drive(f["id"]), f["name"]))
+        except:
+            pass
+
+    # ── Kalshi Depth ──
+    results["kalshi_depth"] = (None, None)
+    for suffix in ["close", "open"]:
+        f_kd = find_file(files, f"kalshi_depth_{today_str}_{suffix}.json")
+        if f_kd:
+            try:
+                results["kalshi_depth"] = (read_json_from_drive(f_kd["id"]), f_kd["name"])
+                break
+            except:
+                pass
+
+    # ── God Mode — prefer PM ──
+    results["god_mode"] = (None, None)
+    for pattern in [f"MLB_God_Mode_{today_str}_PM.xlsx", f"MLB_God_Mode_{today_str}.xlsx"]:
+        f_gm = find_file(files, pattern)
+        if not f_gm:
+            # fallback: contains match
+            f_gm = find_file_contains(files, f"MLB_God_Mode_{today_str}")
+        if f_gm:
+            try:
+                xl_gm = read_excel_file_from_drive(f_gm["id"])
+                raw = download_bytes(f_gm["id"])
+                gm = {sn: pd.read_excel(io.BytesIO(raw), sheet_name=sn) for sn in xl_gm.sheet_names}
+                results["god_mode"] = (gm, f_gm["name"])
+                break
+            except:
+                pass
+
+    # ── Wx Pressure ──
+    f_px = find_file(files, f"game_day_pressure_{today_str}.json")
+    if f_px:
+        try:
+            results["pressure"] = read_json_from_drive(f_px["id"])
+        except:
+            results["pressure"] = None
+    else:
+        results["pressure"] = None
+
+    # ── Master DB ──
+    f_mdb = find_file(files, "MLB_Master_DB.xlsx")
+    if f_mdb:
+        try:
+            results["master_db"] = read_excel_from_drive(f_mdb["id"])
+        except:
+            results["master_db"] = None
+    else:
+        results["master_db"] = None
+
+    # ── Futures Tracker ──
+    f_fut = find_file(files, "MLB_Futures_Tracker.xlsx")
+    results["futures_file_id"] = f_fut["id"] if f_fut else None
+
+    return results
 
 
 # ── MAIN ────────────────────────────────────────────────────────────────────────
@@ -383,8 +421,6 @@ def main():
     now_hst = datetime.now(HST)
     today_str = now_hst.strftime("%Y-%m-%d")
     today_sheet = now_hst.strftime("%m-%d")
-
-    # Determine window from current time
     current_window = "T1" if now_hst.hour < 13 else "T2"
 
     # ── TOP BAR ──
@@ -404,21 +440,27 @@ def main():
 
     # ── LOAD DATA ──
     data = load_all(today_str, today_sheet)
-    df_out, out_err, loaded_sheet = data["outlook"]
-    trade_flows = data["trade_flows"]  # list of (data, filename)
-    kd_data, kd_file = data["kalshi_depth"]
-    gm_data, gm_file = data["god_mode"]
-    px_data = data["pressure"]
-    mdb = data["master_db"]
 
-    # Latest trade flow
+    if "_folder_error" in data:
+        st.error(f"🔴 Drive Error: {data['_folder_error']}")
+        st.stop()
+
+    df_out, out_err, loaded_sheet = data.get("outlook", (None, "Not loaded", None))
+    trade_flows = data.get("trade_flows", [])
+    kd_data, kd_file = data.get("kalshi_depth", (None, None))
+    gm_data, gm_file = data.get("god_mode", (None, None))
+    px_data = data.get("pressure", None)
+    mdb = data.get("master_db", None)
+    futures_file_id = data.get("futures_file_id", None)
+
     tf_data = trade_flows[0][0] if trade_flows else None
     tf_file = trade_flows[0][1] if trade_flows else None
 
     # ── FILE STATUS ROW ──
     def status(ok, label):
         icon = "🟢" if ok else "🔴"
-        return f'<span style="font-family:\'Share Tech Mono\',monospace; font-size:0.75em; color:{"#4caf50" if ok else "#f44336"};">{icon} {label}</span>'
+        color = "#4caf50" if ok else "#f44336"
+        return f'<span style="font-family:\'Share Tech Mono\',monospace; font-size:0.75em; color:{color};">{icon} {label}</span>'
 
     st.markdown(f"""
     <div style="display:flex; gap:20px; background:#12121f; border:1px solid #1a1a2e;
@@ -452,20 +494,16 @@ def main():
         if df_out is None:
             st.markdown(no_plays_html("NO DATA — OUTLOOK NOT LOADED", out_err or ""), unsafe_allow_html=True)
         else:
-            # Filter to current window
             df_window = df_out.copy()
             df_window["_window"] = df_window["game_time_hst"].apply(classify_window)
             df_t = df_window[df_window["_window"] == current_window].copy()
 
-            # Separate plays from passes
             plays_a = df_t[df_t["engine_a_tier"].isin(["PLAY", "ELITE", "STRONG", "LEAN"])].copy()
             plays_b = df_t[df_t["engine_b_tier"].isin(["PLAY", "ELITE", "STRONG", "LEAN"])].copy()
             killed = df_t[df_t["engine_b_tier"] == "KILLED"].copy()
-
             total_plays = len(plays_a) + len(plays_b)
             total_units = plays_a["engine_a_units"].sum() + plays_b["engine_b_units"].sum()
 
-            # KPI
             accent = "#00e5ff" if current_window == "T1" else "#ffab00"
             st.markdown(kpi_html([
                 (f"{current_window} Games", len(df_t), "cyan"),
@@ -481,39 +519,32 @@ def main():
                     f"All {len(df_t)} {current_window} games below threshold."
                 ), unsafe_allow_html=True)
 
-            # ENGINE A PLAYS
+            # ENGINE A
             if len(plays_a) > 0:
                 st.markdown(section_title_html(f"🎯 ENGINE A — SIDES/ML ({current_window})", accent), unsafe_allow_html=True)
                 for _, row in plays_a.iterrows():
-                    matchup = f"{row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}"
                     side = safe(row["engine_a_play_side"], "—").split()[-1]
                     ml_col = "close_home_ml" if row["engine_a_play_side"] == row["home_team"] else "close_away_ml"
                     ml_val = fmt_ml(row.get(ml_col, "—"))
                     tier = str(row["engine_a_tier"])
-                    units = f"→ {row['engine_a_units']}u"
                     play_line = f"{side} ML {ml_val} &nbsp;→&nbsp; {row['engine_a_units']}u"
-                    flags_for = safe(row["engine_a_flags_for"], "")
-                    flags_against = safe(row["engine_a_flags_against"], "")
                     flags_html = ""
-                    if flags_for:
-                        for f in flags_for.split(","):
+                    for f in safe(row["engine_a_flags_for"], "").split(","):
+                        if f.strip():
                             flags_html += f'<div><span style="color:#4caf50;">✅ {f.strip()}</span></div>'
-                    if flags_against:
-                        for f in flags_against.split(","):
+                    for f in safe(row["engine_a_flags_against"], "").split(","):
+                        if f.strip():
                             flags_html += f'<div><span style="color:#f44336;">❌ {f.strip()}</span></div>'
                     meta = f"Engine A {tier} +{row['engine_a_net_score']:.2f} &nbsp;|&nbsp; {row['game_time_hst']} &nbsp;|&nbsp; {safe(row['venue'], '')}"
                     st.markdown(play_card_html(
                         matchup=f"{row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}",
                         time_venue=f"{row['game_time_hst']} · {safe(row['venue'], 'TBD')} · Total {safe(row['close_total'], safe(row['open_total'], '—'))}",
-                        tier=tier,
-                        play_line=play_line,
-                        units=units,
-                        meta=meta,
-                        flags_html=flags_html,
-                        accent=accent,
+                        tier=tier, play_line=play_line,
+                        units=f"→ {row['engine_a_units']}u", meta=meta,
+                        flags_html=flags_html, accent=accent,
                     ), unsafe_allow_html=True)
 
-            # ENGINE B PLAYS
+            # ENGINE B
             if len(plays_b) > 0:
                 st.markdown(section_title_html(f"🎯 ENGINE B — TOTALS ({current_window})", accent), unsafe_allow_html=True)
                 for _, row in plays_b.iterrows():
@@ -521,14 +552,12 @@ def main():
                     total = safe(row["close_total"], safe(row["open_total"], "—"))
                     tier = str(row["engine_b_tier"])
                     play_line = f"{direction} {total} &nbsp;→&nbsp; {row['engine_b_units']}u"
-                    flags_for = safe(row["engine_b_flags_for"], "")
-                    flags_against = safe(row["engine_b_flags_against"], "")
                     flags_html = ""
-                    if flags_for:
-                        for f in flags_for.split(","):
+                    for f in safe(row["engine_b_flags_for"], "").split(","):
+                        if f.strip():
                             flags_html += f'<div><span style="color:#4caf50;">✅ {f.strip()}</span></div>'
-                    if flags_against:
-                        for f in flags_against.split(","):
+                    for f in safe(row["engine_b_flags_against"], "").split(","):
+                        if f.strip():
                             flags_html += f'<div><span style="color:#f44336;">❌ {f.strip()}</span></div>'
                     kill = safe(row["engine_b_kill"], "")
                     if kill:
@@ -537,12 +566,9 @@ def main():
                     st.markdown(play_card_html(
                         matchup=f"{row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}",
                         time_venue=f"{row['game_time_hst']} · {safe(row['venue'], 'TBD')} · Total {total}",
-                        tier=tier,
-                        play_line=play_line,
-                        units=f"→ {row['engine_b_units']}u",
-                        meta=meta,
-                        flags_html=flags_html,
-                        accent=accent,
+                        tier=tier, play_line=play_line,
+                        units=f"→ {row['engine_b_units']}u", meta=meta,
+                        flags_html=flags_html, accent=accent,
                     ), unsafe_allow_html=True)
 
             # KILLED
@@ -560,10 +586,8 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
 
-            # SIGNAL WATCH — passes with scores
+            # SIGNAL WATCH
             st.markdown(section_title_html(f"📡 {current_window} SIGNAL WATCH — ALL GAMES", "#546e7a"), unsafe_allow_html=True)
-            df_passes = df_t[df_t["engine_a_tier"] == "PASS"].copy()
-
             rows_html = ""
             for _, row in df_t.iterrows():
                 ea_score = row.get("engine_a_net_score", 0) or 0
@@ -581,7 +605,6 @@ def main():
                   <td style="padding:5px 10px; color:{b_color}; font-family:'Orbitron',sans-serif; font-size:0.75em; font-weight:700;">{eb_tier} {eb_score:+.2f}</td>
                   <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace; font-size:0.75em;">{safe(row.get('engine_a_flags_for',''), safe(row.get('engine_b_flags_for',''),'—'))[:60]}</td>
                 </tr>"""
-
             st.markdown(f"""
             <div style="overflow-x:auto; background:#12121f; border:1px solid #1a1a2e; border-radius:8px;">
             <table style="width:100%; border-collapse:collapse; font-size:0.78em;">
@@ -607,25 +630,20 @@ def main():
             st.error("Daily Outlook not loaded.")
         else:
             st.markdown(section_title_html(f"📋 FULL SLATE — {today_sheet} ({len(df_out)} games)", "#00e5ff"), unsafe_allow_html=True)
-
-            # Window filter
-            col_f1, col_f2 = st.columns([2, 4])
+            col_f1, _ = st.columns([2, 4])
             with col_f1:
                 w_filter = st.selectbox("Filter", ["All Games", "T1 Only (< 13:00 HST)", "T2 Only (13:00+ HST)"])
-
             df_display = df_out.copy()
             df_display["_window"] = df_display["game_time_hst"].apply(classify_window)
             if "T1" in w_filter:
                 df_display = df_display[df_display["_window"] == "T1"]
             elif "T2" in w_filter:
                 df_display = df_display[df_display["_window"] == "T2"]
-
             cols_show = [
                 "game_time_hst", "away_team", "home_team",
                 "away_starter", "home_starter",
                 "open_away_ml", "open_home_ml", "close_away_ml", "close_home_ml",
-                "open_total", "close_total", "total_change",
-                "ml_fav_move_dir",
+                "open_total", "close_total", "total_change", "ml_fav_move_dir",
                 "engine_a_tier", "engine_a_net_score", "engine_a_play_side",
                 "engine_b_tier", "engine_b_net_score", "engine_b_play_dir",
                 "engine_a_flags_for", "engine_b_flags_for",
@@ -633,7 +651,6 @@ def main():
             ]
             df_show = df_display[[c for c in cols_show if c in df_display.columns]].copy()
             df_show.columns = [c.replace("_", " ").upper() for c in df_show.columns]
-
             st.dataframe(df_show, use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
@@ -641,15 +658,14 @@ def main():
     # ═══════════════════════════════════════════════════════
     with tabs[2]:
         if not trade_flows:
-            st.markdown(alert_html("⚠️ NO TRADE FLOW DATA", f"No trade_flow_{today_str}_*.json found in Data folder."), unsafe_allow_html=True)
+            st.markdown(alert_html("⚠️ NO TRADE FLOW DATA", f"No trade_flow_{today_str}_*.json found in Drive folder."), unsafe_allow_html=True)
         else:
             for tf_d, tf_fname in trade_flows:
                 capture_time = tf_d.get("capture_time", "—")
-                window_h = tf_d.get("lookback_hours", "—")
-                market_count = tf_d.get("market_count", 0)
                 sharp_count = tf_d.get("sharp_count", 0)
+                market_count = tf_d.get("market_count", 0)
                 markets_with_trades = tf_d.get("markets_with_trades", 0)
-
+                window_h = tf_d.get("lookback_hours", "—")
                 st.markdown(section_title_html(f"⚡ {tf_fname} — {sharp_count} SHARP SIGNALS", "#ffab00"), unsafe_allow_html=True)
                 st.markdown(kpi_html([
                     ("Sharp Signals", sharp_count, "amber" if sharp_count > 0 else "muted"),
@@ -658,40 +674,32 @@ def main():
                     ("Lookback Window", f"{window_h}h", "muted"),
                     ("Capture", capture_time[:16].replace("T", " "), "muted"),
                 ]), unsafe_allow_html=True)
-
-                sharp_markets = [m for m in tf_d["markets"] if m["sharp_signal"]["triggered"]]
+                sharp_markets = [m for m in tf_d.get("markets", []) if m["sharp_signal"]["triggered"]]
                 if not sharp_markets:
                     st.markdown(no_plays_html("NO SHARP SIGNALS TRIGGERED"), unsafe_allow_html=True)
                     continue
-
-                # Group by market type
                 from collections import defaultdict
                 by_type = defaultdict(list)
                 for m in sharp_markets:
                     by_type[m["market_type"]].append(m)
-
-                type_order = ["moneyline", "spread", "total"]
-                for mtype in type_order:
+                for mtype in ["moneyline", "spread", "total"]:
                     if mtype not in by_type:
                         continue
                     markets = by_type[mtype]
                     st.markdown(section_title_html(f"{mtype.upper()} ({len(markets)} signals)", "#00e5ff"), unsafe_allow_html=True)
-
                     rows = ""
                     for m in sorted(markets, key=lambda x: -abs(x["sharp_signal"]["divergence"])):
                         ss = m["sharp_signal"]
                         df_info = m["dollar_flow"]
                         ts = m["trade_size"]
                         rows += sharp_row_html(
-                            title=m["title"],
-                            mtype=mtype,
+                            title=m["title"], mtype=mtype,
                             direction=ss["direction"] or "—",
                             signal_type=ss["signal_type"],
                             divergence=ss["divergence"],
                             big_money=ts["big_money_flag"],
                             dollars=df_info["total"],
                         )
-
                     st.markdown(f"""
                     <div style="overflow-x:auto; background:#12121f; border:1px solid #1a1a2e; border-radius:8px; margin-bottom:16px;">
                     <table style="width:100%; border-collapse:collapse; font-size:0.77em; font-family:'Share Tech Mono',monospace;">
@@ -725,7 +733,6 @@ def main():
                 ("Snapshot Time", meta.get("snapshot_time", "—")[:16].replace("T", " "), "muted"),
                 ("File", kd_file or "—", "muted"),
             ]), unsafe_allow_html=True)
-
             for game in games:
                 away = game.get("away_team", "—")
                 home = game.get("home_team", "—")
@@ -734,32 +741,25 @@ def main():
                 spread = game.get("spread", {})
                 total = game.get("total", {})
                 rfi = game.get("rfi", {})
-
                 home_ml = ml.get("home", {})
                 away_ml = ml.get("away", {})
-
                 home_prob = home_ml.get("last_price", "—")
                 away_prob = away_ml.get("last_price", "—")
                 total_line = total.get("primary_line", "—")
                 total_over = total.get("yes_bid", "—")
                 spread_line = spread.get("primary_line", "—") if spread.get("available") else "N/A"
-
                 hp_str = f"{home_prob:.0%}" if isinstance(home_prob, float) else "—"
                 ap_str = f"{away_prob:.0%}" if isinstance(away_prob, float) else "—"
                 to_str = f"{total_over:.0%}" if isinstance(total_over, float) else "—"
-
-                # Trade flow from depth file
                 tf_game = game.get("trade_flow", {})
                 ml_tf = tf_game.get("moneyline", {})
                 ml_sharp = ml_tf.get("sharp_signal", {})
                 sharp_triggered = ml_sharp.get("triggered", False)
                 sharp_dir = ml_sharp.get("direction", "—")
-
                 sharp_badge = ""
                 if sharp_triggered:
                     sc = "#4caf50" if sharp_dir == "YES" else "#f44336"
                     sharp_badge = f'<span style="background:rgba(76,175,80,0.15); border:1px solid {sc}; color:{sc}; padding:2px 8px; border-radius:3px; font-size:0.72em; font-family:\'Orbitron\',sans-serif; font-weight:700;">⚡ SHARP {sharp_dir}</span>'
-
                 st.markdown(f"""
                 <div style="background:#12121f; border:1px solid #1a1a2e; border-radius:8px;
                      padding:10px 16px; margin-bottom:8px; font-family:'Share Tech Mono',monospace;">
@@ -783,14 +783,13 @@ def main():
     # ═══════════════════════════════════════════════════════
     with tabs[4]:
         if gm_data is None:
-            st.markdown(alert_html("⚠️ GOD MODE NOT LOADED", f"No MLB_God_Mode_{today_str}*.xlsx found in Data folder."), unsafe_allow_html=True)
+            st.markdown(alert_html("⚠️ GOD MODE NOT LOADED", f"No MLB_God_Mode_{today_str}*.xlsx found in Drive folder."), unsafe_allow_html=True)
         else:
-            gm_tabs_names = list(gm_data.keys())
-            gm_tabs = st.tabs(gm_tabs_names)
-            for i, sname in enumerate(gm_tabs_names):
+            gm_tab_names = list(gm_data.keys())
+            gm_tabs = st.tabs(gm_tab_names)
+            for i, sname in enumerate(gm_tab_names):
                 with gm_tabs[i]:
-                    df_gm = gm_data[sname].copy()
-                    st.dataframe(df_gm, use_container_width=True, height=500)
+                    st.dataframe(gm_data[sname], use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
     # TAB 5 — WX PRESSURE
@@ -807,19 +806,15 @@ def main():
                 ("Dome Skip", summary.get("dome_skip", 0), "muted"),
                 ("Errors", summary.get("errors", 0), "red" if summary.get("errors", 0) > 0 else "muted"),
             ]), unsafe_allow_html=True)
-
-            results = px_data.get("results", [])
-            for r in results:
+            for r in px_data.get("results", []):
                 team = r.get("team", "—")
                 park = r.get("park", "—")
                 classification = r.get("classification", "NEUTRAL")
                 anomaly = r.get("anomaly_hpa", 0)
                 sigma = r.get("anomaly_sigma", 0)
                 avg_hpa = r.get("game_window_avg_hpa", 0)
-
                 cls_color = {"HITTER_BOOST": "#4caf50", "PITCHER_BOOST": "#f44336", "NEUTRAL": "#546e7a"}.get(classification, "#546e7a")
                 roof = r.get("roof_warning", "")
-
                 st.markdown(f"""
                 <div style="background:#12121f; border:1px solid #1a1a2e; border-radius:6px;
                      padding:8px 14px; margin-bottom:6px; font-family:'Share Tech Mono',monospace; font-size:0.78em;
@@ -829,7 +824,7 @@ def main():
                   <span style="font-family:'Orbitron',sans-serif; font-size:0.7em; font-weight:700; color:{cls_color};
                        padding:2px 8px; border:1px solid {cls_color}40; border-radius:4px;">{classification}</span>
                   <span style="color:#888;">Anomaly: <span style="color:#00e5ff;">{anomaly:+.2f} hPa</span></span>
-                  <span style="color:#888;">σ: <span style="color:#888;">{sigma:.2f}</span></span>
+                  <span style="color:#888;">σ: {sigma:.2f}</span>
                   <span style="color:#888;">Avg: {avg_hpa:.1f} hPa</span>
                   {"<span style='color:#ffab00; font-size:0.72em;'>⚠️ RETRACTABLE</span>" if "RETRACTABLE" in roof else ""}
                 </div>
@@ -839,36 +834,46 @@ def main():
     # TAB 6 — FUTURES
     # ═══════════════════════════════════════════════════════
     with tabs[6]:
-        futures_path = os.path.join(DATA_DIR, "MLB_Futures_Tracker.xlsx")
-        if not os.path.exists(futures_path):
-            st.markdown(alert_html("⚠️ FUTURES TRACKER NOT FOUND", futures_path), unsafe_allow_html=True)
+        if not futures_file_id:
+            st.markdown(alert_html("⚠️ FUTURES TRACKER NOT FOUND", "MLB_Futures_Tracker.xlsx not found in Drive folder."), unsafe_allow_html=True)
         else:
             try:
-                xl_fut = pd.ExcelFile(futures_path)
+                raw_fut = download_bytes(futures_file_id)
+                xl_fut = pd.ExcelFile(io.BytesIO(raw_fut))
                 sheet_names = xl_fut.sheet_names
                 sel_sheet = st.selectbox("Snapshot", sheet_names)
-                df_fut = pd.read_excel(futures_path, sheet_name=sel_sheet)
-
-                # Teams sheets have WS % — render custom table
-                # Wins/Awards/other sheets — just show raw dataframe
+                df_fut = pd.read_excel(io.BytesIO(raw_fut), sheet_name=sel_sheet)
                 if "WS %" in df_fut.columns:
                     df_fut_sorted = df_fut.sort_values("WS %", ascending=False).head(15)
                     st.markdown(section_title_html(f"🏆 WORLD SERIES ODDS — {sel_sheet}", "#ffab00"), unsafe_allow_html=True)
-
                     rows_f = ""
                     for _, row in df_fut_sorted.iterrows():
                         ws_pct = float(row.get("WS %", 0) or 0)
                         pl_pct = float(row.get("Playoff %", 0) or 0)
-                        pl_str = f"{pl_pct:.0f}%" if pl_pct else "—"
                         bar_w = int(ws_pct * 2)
-                        rows_f += f"""<tr style="border-bottom:1px solid #1a1a2e20;"><td style="padding:6px 10px; color:#fff; font-family:'Share Tech Mono',monospace;">{row.get('Team','—')}</td><td style="padding:6px 10px;"><div style="display:flex; align-items:center; gap:8px;"><div style="width:{bar_w}px; height:8px; background:#ffab00; border-radius:2px; min-width:2px;"></div><span style="color:#ffab00; font-family:'Orbitron',sans-serif; font-size:0.85em; font-weight:700;">{ws_pct:.0f}%</span></div></td><td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{row.get('Pennant %','—')}%</td><td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{row.get('Div %','—')}%</td><td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{pl_str}</td><td style="padding:6px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace; font-size:0.8em;">${float(row.get('WS Vol ($)', 0) or 0):,.0f}</td></tr>"""
-
-                    st.markdown(f"""<div style="overflow-x:auto; background:#12121f; border:1px solid #1a1a2e; border-radius:8px;"><table style="width:100%; border-collapse:collapse; font-size:0.8em;"><thead><tr style="background:#0d0d18;"><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Team</th><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">WS %</th><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Pennant</th><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Division</th><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Playoff</th><th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">WS Volume</th></tr></thead><tbody>{rows_f}</tbody></table></div>""", unsafe_allow_html=True)
+                        rows_f += f"""<tr style="border-bottom:1px solid #1a1a2e20;">
+<td style="padding:6px 10px; color:#fff; font-family:'Share Tech Mono',monospace;">{row.get('Team','—')}</td>
+<td style="padding:6px 10px;"><div style="display:flex; align-items:center; gap:8px;"><div style="width:{bar_w}px; height:8px; background:#ffab00; border-radius:2px; min-width:2px;"></div><span style="color:#ffab00; font-family:'Orbitron',sans-serif; font-size:0.85em; font-weight:700;">{ws_pct:.0f}%</span></div></td>
+<td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{row.get('Pennant %','—')}%</td>
+<td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{row.get('Div %','—')}%</td>
+<td style="padding:6px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{"—" if not pl_pct else f"{pl_pct:.0f}%"}</td>
+<td style="padding:6px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace; font-size:0.8em;">${float(row.get('WS Vol ($)', 0) or 0):,.0f}</td>
+</tr>"""
+                    st.markdown(f"""<div style="overflow-x:auto; background:#12121f; border:1px solid #1a1a2e; border-radius:8px;">
+<table style="width:100%; border-collapse:collapse; font-size:0.8em;">
+<thead><tr style="background:#0d0d18;">
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Team</th>
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">WS %</th>
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Pennant</th>
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Division</th>
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Playoff</th>
+<th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">WS Volume</th>
+</tr></thead>
+<tbody>{rows_f}</tbody>
+</table></div>""", unsafe_allow_html=True)
                 else:
-                    # Wins / Awards / other sheets — raw dataframe display
                     st.markdown(section_title_html(f"📊 {sel_sheet}", "#ffab00"), unsafe_allow_html=True)
                     st.dataframe(df_fut, use_container_width=True, height=400)
-
             except Exception as e:
                 st.error(f"Futures load error: {e}")
 
@@ -877,7 +882,7 @@ def main():
     <div style="text-align:center; margin-top:30px; padding-top:16px; border-top:1px solid #1a1a2e;
          font-size:0.7em; color:#546e7a; font-family:'Share Tech Mono',monospace;">
       MLB Flag Finder &nbsp;|&nbsp; Play Card &nbsp;|&nbsp; {today_str} {current_window}<br>
-      Data: {DATA_DIR} &nbsp;|&nbsp; Outlook: {loaded_sheet or '—'} &nbsp;|&nbsp; Trade Flow: {tf_file or '—'}<br>
+      Data: Google Drive / {DRIVE_FOLDER_NAME} &nbsp;|&nbsp; Outlook: {loaded_sheet or '—'} &nbsp;|&nbsp; Trade Flow: {tf_file or '—'}<br>
       For internal use only. Not financial advice.
     </div>
     """, unsafe_allow_html=True)
