@@ -612,7 +612,7 @@ def main():
                   <td style="padding:5px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{safe(row.get('close_total',''),safe(row.get('open_total',''),'—'))}</td>
                   <td style="padding:5px 10px; color:{a_color}; font-family:'Orbitron',sans-serif; font-size:0.75em; font-weight:700;">{ea_tier} {ea_score:+.2f}</td>
                   <td style="padding:5px 10px; color:{b_color}; font-family:'Orbitron',sans-serif; font-size:0.75em; font-weight:700;">{eb_tier} {eb_score:+.2f}</td>
-                  <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace; font-size:0.75em;">{safe(row.get('engine_a_flags_for',''), safe(row.get('engine_b_flags_for',''),'—'))[:60]}</td>
+                  <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace; font-size:0.75em;">{str(safe(row.get('engine_a_flags_for',''), safe(row.get('engine_b_flags_for',''),'—')))[:60]}</td>
                 </tr>"""
             st.markdown(f"""
             <div style="overflow-x:auto; background:#12121f; border:1px solid #1a1a2e; border-radius:8px;">
