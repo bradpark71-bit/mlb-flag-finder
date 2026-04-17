@@ -586,14 +586,27 @@ def main():
             st.markdown(section_title_html(f"📡 {current_window} SIGNAL WATCH — ALL GAMES", "#546e7a"), unsafe_allow_html=True)
             rows_html = ""
             for _, row in df_t.iterrows():
-                ea_score = row.get("engine_a_net_score", 0) or 0
-                eb_score = row.get("engine_b_net_score", 0) or 0
+                def num(val, default=0.0):
+                    try:
+                        v = float(val)
+                        return v if v == v else default  # NaN check
+                    except:
+                        return default
+                def teamlast(col):
+                    v = row.get(col, "")
+                    try:
+                        s = str(v).strip()
+                        return s.split()[-1] if s and s not in ("nan", "None", "") else "—"
+                    except:
+                        return "—"
+                ea_score = num(row.get("engine_a_net_score"))
+                eb_score = num(row.get("engine_b_net_score"))
                 ea_tier = safe(row.get("engine_a_tier", ""), "PASS")
                 eb_tier = safe(row.get("engine_b_tier", ""), "PASS")
                 a_color = "#4caf50" if ea_tier in ("ELITE", "PLAY") else ("#f44336" if ea_tier == "KILLED" else "#546e7a")
                 b_color = "#4caf50" if eb_tier in ("ELITE", "PLAY") else ("#f44336" if eb_tier == "KILLED" else "#546e7a")
                 rows_html += f"""<tr style="border-bottom:1px solid #1a1a2e20;">
-                  <td style="padding:5px 10px; color:#fff; font-family:'Share Tech Mono',monospace; white-space:nowrap;">{safe(row.get('away_team',''),'').split()[-1]} @ {safe(row.get('home_team',''),'').split()[-1]}</td>
+                  <td style="padding:5px 10px; color:#fff; font-family:'Share Tech Mono',monospace; white-space:nowrap;">{teamlast('away_team')} @ {teamlast('home_team')}</td>
                   <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace;">{safe(row.get('game_time_hst',''),'—')}</td>
                   <td style="padding:5px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{fmt_ml(row.get('close_away_ml',''))} / {fmt_ml(row.get('close_home_ml',''))}</td>
                   <td style="padding:5px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{safe(row.get('close_total',''),safe(row.get('open_total',''),'—'))}</td>
