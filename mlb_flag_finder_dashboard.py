@@ -1,7 +1,12 @@
 """
-⚡ MLB Flag Finder Dashboard — Streamlit Cloud Edition
+⚡ MLB Flag Finder Dashboard — Streamlit Cloud Edition v1.2
 Pulls all data files from Google Drive "MLB 2026" folder via service account.
-Local path references replaced with Drive API calls.
+v1.2 changes:
+  - Tier harmonization: ELITE / PLAY / PASS only (removed LEAN, STRONG)
+  - ELITE = 1.5u (Engine B), 1.0u (Engine A) | PLAY = 0.5u both engines
+  - Added weather_pressure_hpa to Full Slate column display
+  - Removed Kalshi Depth, WX Pressure, and Chat 2 Plays tabs
+  - DIR-CONFLICT-KILL renders via existing generic kill logic
 """
 import streamlit as st
 import pandas as pd
@@ -9,6 +14,7 @@ import json
 import io
 import os
 from datetime import datetime
+from collections import defaultdict
 import pytz
 
 # ── GOOGLE DRIVE IMPORTS ───────────────────────────────────────────────────────
@@ -17,7 +23,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-DRIVE_FOLDER_NAME = "MLB 2026"   # Exact folder name shared with service account
+DRIVE_FOLDER_NAME = "MLB 2026"
 HST = pytz.timezone("Pacific/Honolulu")
 
 st.set_page_config(
@@ -30,7 +36,6 @@ st.set_page_config(
 # ── GOOGLE DRIVE AUTH ──────────────────────────────────────────────────────────
 @st.cache_resource
 def get_drive_service():
-    """Build Drive service from Streamlit secrets (service account JSON)."""
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -41,7 +46,6 @@ def get_drive_service():
 
 @st.cache_data(ttl=300)
 def get_folder_id(folder_name: str) -> str | None:
-    """Find the Drive folder ID by name."""
     service = get_drive_service()
     resp = service.files().list(
         q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
@@ -54,7 +58,6 @@ def get_folder_id(folder_name: str) -> str | None:
 
 @st.cache_data(ttl=300)
 def list_folder_files(folder_id: str) -> list[dict]:
-    """Return all files in a Drive folder (non-trashed)."""
     service = get_drive_service()
     results = []
     page_token = None
@@ -73,7 +76,6 @@ def list_folder_files(folder_id: str) -> list[dict]:
 
 
 def find_file(files: list[dict], name: str) -> dict | None:
-    """Exact filename match."""
     for f in files:
         if f["name"] == name:
             return f
@@ -81,7 +83,6 @@ def find_file(files: list[dict], name: str) -> dict | None:
 
 
 def find_file_contains(files: list[dict], substring: str) -> dict | None:
-    """First file whose name contains substring."""
     for f in files:
         if substring in f["name"]:
             return f
@@ -89,13 +90,11 @@ def find_file_contains(files: list[dict], substring: str) -> dict | None:
 
 
 def find_files_contains(files: list[dict], substring: str) -> list[dict]:
-    """All files whose name contains substring, sorted desc by name."""
     matches = [f for f in files if substring in f["name"]]
     return sorted(matches, key=lambda x: x["name"], reverse=True)
 
 
 def download_bytes(file_id: str) -> bytes:
-    """Download a file from Drive as raw bytes."""
     service = get_drive_service()
     request = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
@@ -122,7 +121,7 @@ def read_json_from_drive(file_id: str) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-# ── CSS — matches play card exactly ────────────────────────────────────────────
+# ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
@@ -202,7 +201,7 @@ hr { border-color: #1a1a2e !important; }
 """, unsafe_allow_html=True)
 
 # ── HTML COMPONENTS ─────────────────────────────────────────────────────────────
-def header_html(today_str, window, version="v1.1g6a"):
+def header_html(today_str, window, version="v1.2"):
     accent = "#00e5ff" if window == "T1" else "#ffab00"
     badge_class = "t1" if window == "T1" else "t2"
     now_hst = datetime.now(HST).strftime("%I:%M %p HST")
@@ -264,9 +263,8 @@ def no_plays_html(msg, detail=""):
 
 def play_card_html(matchup, time_venue, tier, play_line, units, meta, flags_html, note="", accent="#ffab00"):
     tier_colors = {
-        "LEAN":   ("#80d8ff", "rgba(128,216,255,0.12)", "#80d8ff40"),
-        "STRONG": ("#4caf50", "rgba(76,175,80,0.15)",   "#4caf5040"),
         "ELITE":  ("#00e5ff", "rgba(0,229,255,0.12)",   "#00e5ff40"),
+        "PLAY":   ("#4caf50", "rgba(76,175,80,0.15)",   "#4caf5040"),
     }
     tc, tbg, tborder = tier_colors.get(tier.upper(), ("#888", "rgba(136,136,136,0.1)", "#88888840"))
     note_html = f'<div style="font-size:0.74em; color:#546e7a; padding:8px 16px; background:#0a0a12; border-top:1px solid #1a1a2e20; font-style:italic; font-family:\'Share Tech Mono\',monospace;">{note}</div>' if note else ""
@@ -325,12 +323,19 @@ def safe(val, default="—"):
         return default
     return val if str(val) not in ("nan", "None", "") else default
 
-# ── DATA LOADERS (Drive-backed) ─────────────────────────────────────────────────
+def tier_units(tier, engine="A"):
+    """v1.2 harmonized units: ELITE=1.0u EngA / 1.5u EngB, PLAY=0.5u both."""
+    if tier.upper() == "ELITE":
+        return "1.0u" if engine == "A" else "1.5u"
+    if tier.upper() == "PLAY":
+        return "0.5u"
+    return "0u"
+
+# ── DATA LOADER ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_all(today_str: str, today_sheet: str) -> dict:
     results = {}
 
-    # ── Get folder listing ──
     folder_id = get_folder_id(DRIVE_FOLDER_NAME)
     if not folder_id:
         results["_folder_error"] = f"Drive folder '{DRIVE_FOLDER_NAME}' not found. Check folder sharing."
@@ -361,23 +366,11 @@ def load_all(today_str: str, today_sheet: str) -> dict:
         except:
             pass
 
-    # ── Kalshi Depth ──
-    results["kalshi_depth"] = (None, None)
-    for suffix in ["close", "open"]:
-        f_kd = find_file(files, f"kalshi_depth_{today_str}_{suffix}.json")
-        if f_kd:
-            try:
-                results["kalshi_depth"] = (read_json_from_drive(f_kd["id"]), f_kd["name"])
-                break
-            except:
-                pass
-
     # ── God Mode — prefer PM ──
     results["god_mode"] = (None, None)
     for pattern in [f"MLB_God_Mode_{today_str}_PM.xlsx", f"MLB_God_Mode_{today_str}.xlsx"]:
         f_gm = find_file(files, pattern)
         if not f_gm:
-            # fallback: contains match
             f_gm = find_file_contains(files, f"MLB_God_Mode_{today_str}")
         if f_gm:
             try:
@@ -388,16 +381,6 @@ def load_all(today_str: str, today_sheet: str) -> dict:
                 break
             except:
                 pass
-
-    # ── Wx Pressure ──
-    f_px = find_file(files, f"game_day_pressure_{today_str}.json")
-    if f_px:
-        try:
-            results["pressure"] = read_json_from_drive(f_px["id"])
-        except:
-            results["pressure"] = None
-    else:
-        results["pressure"] = None
 
     # ── Master DB ──
     f_mdb = find_file(files, "MLB_Master_DB.xlsx")
@@ -414,112 +397,6 @@ def load_all(today_str: str, today_sheet: str) -> dict:
     results["futures_file_id"] = f_fut["id"] if f_fut else None
 
     return results
-
-
-# ── PLAYS JSON LOADER ──────────────────────────────────────────────────────────
-def load_plays_json(files, date_str, tier="T1"):
-    suffix = "" if tier == "T1" else "_T2"
-    fname = f"plays_{date_str}{suffix}.json"
-    match = [f for f in files if f["name"] == fname]
-    if not match:
-        return None
-    try:
-        return read_json_from_drive(match[0]["id"])
-    except:
-        return None
-
-
-def render_plays_json_tab(files, today_str, current_window):
-    """Render Chat 2 pre-computed plays JSON — source of truth tab."""
-    t1_data = load_plays_json(files, today_str, "T1")
-    t2_data = load_plays_json(files, today_str, "T2")
-
-    if not t1_data and not t2_data:
-        st.markdown(no_plays_html(
-            "NO PLAYS FILE YET",
-            f"Chat 2 hasn't written plays_{today_str}.json or plays_{today_str}_T2.json to Drive yet."
-        ), unsafe_allow_html=True)
-        return
-
-    for tier, data in [("T1", t1_data), ("T2", t2_data)]:
-        if not data:
-            st.markdown(f'<div style="background:#12121f; border:1px dashed #546e7a40; border-radius:6px; padding:10px 16px; margin-bottom:12px; font-family:\'Share Tech Mono\',monospace; font-size:0.76em; color:#546e7a;">{tier}: no plays file written yet</div>', unsafe_allow_html=True)
-            continue
-
-        accent = "#00e5ff" if tier == "T1" else "#ffab00"
-        plays    = data.get("plays", [])
-        flags    = data.get("flags", [])
-        kills    = data.get("kills", [])
-        bifurcs  = data.get("bifurcations", [])
-        preflags = data.get("t2_preflags", [])
-        shadows  = data.get("shadow_fires", [])
-        meta     = data.get("meta", {})
-        total_units = sum(p.get("units", 0) for p in plays)
-        capture = meta.get("capture_time", "—")[:16].replace("T", " ")
-
-        st.markdown(section_title_html(
-            f"{'🎯' if plays else '—'} CHAT 2 — {tier}  |  {len(plays)} play{'s' if len(plays) != 1 else ''}  ·  {total_units:.1f}u  ·  {meta.get('engine_version','—')}",
-            accent
-        ), unsafe_allow_html=True)
-
-        st.markdown(kpi_html([
-            ("Plays", len(plays), "green" if plays else "muted"),
-            ("Total Units", f"{total_units:.1f}u", "amber" if total_units > 0 else "muted"),
-            ("Flags", len(flags), "amber" if flags else "muted"),
-            ("Kills", len(kills), "red" if kills else "muted"),
-            ("Captured", capture, "muted"),
-        ]), unsafe_allow_html=True)
-
-        if plays:
-            for p in plays:
-                sigs_html = ""
-                for s in p.get("key_signals", []):
-                    sigs_html += f'<div><span style="color:#4caf50;">✅ {s}</span></div>'
-                for f in p.get("flags", []):
-                    sigs_html += f'<div><span style="color:#f44336;">❌ {f}</span></div>'
-                sp_line = p.get("sp", "")
-                if sp_line:
-                    sigs_html += f'<div><span style="color:#888;">📐 {sp_line}</span></div>'
-                st.markdown(play_card_html(
-                    matchup=p.get("game", "—"),
-                    time_venue=f"{p.get('time_hst','—')} HST",
-                    tier=p.get("level", "LEAN"),
-                    play_line=p.get("play", "—"),
-                    units=f"→ {p.get('units', 0)}u",
-                    meta=f"Engine {p.get('engine','?')}  ·  Score +{p.get('score',0):.2f}  ·  {p.get('plr_id','—')}",
-                    flags_html=sigs_html,
-                    accent=accent,
-                ), unsafe_allow_html=True)
-        else:
-            st.markdown(no_plays_html(f"NO {tier} PLAYS", "All games below threshold."), unsafe_allow_html=True)
-
-        if kills:
-            st.markdown(section_title_html("🔴 KILLS", "#f44336"), unsafe_allow_html=True)
-            for k in kills:
-                st.markdown(f'<div style="background:#12121f; border:1px solid #f4433640; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#f44336;">🔴 <strong>{k.get("game","—")}</strong> — {k.get("note","—")}</div>', unsafe_allow_html=True)
-
-        if flags:
-            st.markdown(section_title_html("🚩 FLAGS", "#ffab00"), unsafe_allow_html=True)
-            for f in flags:
-                sev_color = "#f44336" if f.get("severity") in ("WARN", "AMBER") else "#546e7a"
-                st.markdown(f'<div style="background:#12121f; border:1px solid {sev_color}40; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:{sev_color};">🚩 <strong>{f.get("id","—")}</strong> [{f.get("severity","INFO")}] — {f.get("note","—")}</div>', unsafe_allow_html=True)
-
-        if bifurcs:
-            st.markdown(section_title_html("⚡ BIFURCATIONS", "#f44336"), unsafe_allow_html=True)
-            for b in bifurcs:
-                st.markdown(f'<div style="background:#12121f; border:1px solid #f4433640; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#f44336;">⚡ <strong>{b.get("game","—")}</strong> — {b.get("note","—")}</div>', unsafe_allow_html=True)
-
-        if tier == "T1" and preflags:
-            st.markdown(section_title_html(f"⭐ T2 PRE-FLAGS ({len(preflags)})", "#ce93d8"), unsafe_allow_html=True)
-            for pf in preflags:
-                st.markdown(f'<div style="background:#12121f; border:1px solid #ce93d840; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#ce93d8;">⭐ <strong>{pf.get("game","—")}</strong>  EA +{pf.get("ea_score",0):.2f}  —  {pf.get("note","—")}</div>', unsafe_allow_html=True)
-
-        if shadows:
-            st.markdown(section_title_html("🌡️ SHADOW FIRES", "#546e7a"), unsafe_allow_html=True)
-            for s in shadows:
-                st.markdown(f'<div style="background:#12121f; border:1px solid #546e7a40; border-radius:6px; padding:8px 14px; margin-bottom:6px; font-family:\'Share Tech Mono\',monospace; font-size:0.78em; color:#546e7a;">🌡️ <strong>{s.get("signal","—")}</strong> — {s.get("game","—")} — {s.get("note","—")}</div>', unsafe_allow_html=True)
-
-        st.markdown("<hr style='border-color:#1a1a2e; margin:20px 0;'>", unsafe_allow_html=True)
 
 
 # ── MAIN ────────────────────────────────────────────────────────────────────────
@@ -550,10 +427,7 @@ def main():
 
     df_out, out_err, loaded_sheet = data.get("outlook", (None, "Not loaded", None))
     trade_flows = data.get("trade_flows", [])
-    kd_data, kd_file = data.get("kalshi_depth", (None, None))
     gm_data, gm_file = data.get("god_mode", (None, None))
-    px_data = data.get("pressure", None)
-    mdb = data.get("master_db", None)
     futures_file_id = data.get("futures_file_id", None)
 
     tf_data = trade_flows[0][0] if trade_flows else None
@@ -570,9 +444,8 @@ def main():
          border-radius:6px; padding:8px 16px; margin-bottom:18px; flex-wrap:wrap;">
       {status(df_out is not None, "Daily Outlook")}
       {status(tf_data is not None, f"Trade Flow ({tf_file or 'missing'})")}
-      {status(kd_data is not None, f"Kalshi Depth ({kd_file or 'missing'})")}
       {status(gm_data is not None, f"God Mode ({gm_file or 'missing'})")}
-      {status(px_data is not None, "Wx Pressure")}
+      {status(futures_file_id is not None, "Futures Tracker")}
     </div>
     """, unsafe_allow_html=True)
 
@@ -582,25 +455,15 @@ def main():
     # ── TABS ──
     tabs = st.tabs([
         "📡 TODAY'S PLAYS",
-        "🎯 CHAT 2 PLAYS",
         "📋 FULL SLATE",
         "⚡ SHARP MONEY",
-        "📊 KALSHI DEPTH",
         "⛽ GOD MODE",
-        "🌪️ WX PRESSURE",
         "📈 FUTURES",
     ])
 
     # ═══════════════════════════════════════════════════════
-    # TAB 1 — CHAT 2 PLAYS (pre-computed JSON)
-    # ═══════════════════════════════════════════════════════
-    with tabs[1]:
-        folder_id_for_plays = get_folder_id(DRIVE_FOLDER_NAME)
-        files_for_plays = list_folder_files(folder_id_for_plays) if folder_id_for_plays else []
-        render_plays_json_tab(files_for_plays, today_str, current_window)
-
-    # ═══════════════════════════════════════════════════════
-    # TAB 0 — TODAY'S PLAYS (dashboard scoring)
+    # TAB 0 — TODAY'S PLAYS
+    # v1.2: filter on ELITE/PLAY only (removed LEAN/STRONG)
     # ═══════════════════════════════════════════════════════
     with tabs[0]:
         if df_out is None:
@@ -610,11 +473,29 @@ def main():
             df_window["_window"] = df_window["game_time_hst"].apply(classify_window)
             df_t = df_window[df_window["_window"] == current_window].copy()
 
-            plays_a = df_t[df_t["engine_a_tier"].isin(["PLAY", "ELITE", "STRONG", "LEAN"])].copy()
-            plays_b = df_t[df_t["engine_b_tier"].isin(["PLAY", "ELITE", "STRONG", "LEAN"])].copy()
-            killed = df_t[df_t["engine_b_tier"] == "KILLED"].copy()
+            # v1.2 tiers: ELITE and PLAY only
+            plays_a = df_t[df_t["engine_a_tier"].isin(["ELITE", "PLAY"])].copy()
+            plays_b = df_t[df_t["engine_b_tier"].isin(["ELITE", "PLAY"])].copy()
+            killed  = df_t[df_t["engine_b_tier"] == "KILLED"].copy()
             total_plays = len(plays_a) + len(plays_b)
-            total_units = plays_a["engine_a_units"].sum() + plays_b["engine_b_units"].sum()
+
+            # Units from column if present, else derive from tier (v1.2 harmonized)
+            def get_units_a(row):
+                try:
+                    u = float(row.get("engine_a_units", 0) or 0)
+                    return u if u > 0 else float({"ELITE": 1.0, "PLAY": 0.5}.get(str(row["engine_a_tier"]).upper(), 0))
+                except:
+                    return 0.0
+
+            def get_units_b(row):
+                try:
+                    u = float(row.get("engine_b_units", 0) or 0)
+                    return u if u > 0 else float({"ELITE": 1.5, "PLAY": 0.5}.get(str(row["engine_b_tier"]).upper(), 0))
+                except:
+                    return 0.0
+
+            total_units = sum(get_units_a(r) for _, r in plays_a.iterrows()) + \
+                          sum(get_units_b(r) for _, r in plays_b.iterrows())
 
             accent = "#00e5ff" if current_window == "T1" else "#ffab00"
             st.markdown(kpi_html([
@@ -631,55 +512,57 @@ def main():
                     f"All {len(df_t)} {current_window} games below threshold."
                 ), unsafe_allow_html=True)
 
-            # ENGINE A
+            # ENGINE A — SIDES/ML
             if len(plays_a) > 0:
                 st.markdown(section_title_html(f"🎯 ENGINE A — SIDES/ML ({current_window})", accent), unsafe_allow_html=True)
                 for _, row in plays_a.iterrows():
+                    tier = str(row["engine_a_tier"]).upper()
+                    u = get_units_a(row)
                     side = safe(row["engine_a_play_side"], "—").split()[-1]
                     ml_col = "close_home_ml" if row["engine_a_play_side"] == row["home_team"] else "close_away_ml"
                     ml_val = fmt_ml(row.get(ml_col, "—"))
-                    tier = str(row["engine_a_tier"])
-                    play_line = f"{side} ML {ml_val} &nbsp;→&nbsp; {row['engine_a_units']}u"
+                    play_line = f"{side} ML {ml_val}"
                     flags_html = ""
-                    for f in safe(row["engine_a_flags_for"], "").split(","):
+                    for f in safe(row.get("engine_a_flags_for", ""), "").split(","):
                         if f.strip():
                             flags_html += f'<div><span style="color:#4caf50;">✅ {f.strip()}</span></div>'
-                    for f in safe(row["engine_a_flags_against"], "").split(","):
+                    for f in safe(row.get("engine_a_flags_against", ""), "").split(","):
                         if f.strip():
                             flags_html += f'<div><span style="color:#f44336;">❌ {f.strip()}</span></div>'
-                    meta = f"Engine A {tier} +{row['engine_a_net_score']:.2f} &nbsp;|&nbsp; {row['game_time_hst']} &nbsp;|&nbsp; {safe(row['venue'], '')}"
+                    meta = f"Engine A {tier} +{row.get('engine_a_net_score', 0):.2f} &nbsp;|&nbsp; {safe(row['game_time_hst'], '—')} HST &nbsp;|&nbsp; {safe(row.get('venue', ''), 'TBD')}"
                     st.markdown(play_card_html(
-                        matchup=f"{row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}",
-                        time_venue=f"{row['game_time_hst']} · {safe(row['venue'], 'TBD')} · Total {safe(row['close_total'], safe(row['open_total'], '—'))}",
+                        matchup=f"{safe(row['away_team'],'').split()[-1]} @ {safe(row['home_team'],'').split()[-1]}",
+                        time_venue=f"{safe(row['game_time_hst'],'—')} HST · {safe(row.get('venue',''),'TBD')} · Total {safe(row.get('close_total',''), safe(row.get('open_total',''),'—'))}",
                         tier=tier, play_line=play_line,
-                        units=f"→ {row['engine_a_units']}u", meta=meta,
+                        units=f"→ {u}u", meta=meta,
                         flags_html=flags_html, accent=accent,
                     ), unsafe_allow_html=True)
 
-            # ENGINE B
+            # ENGINE B — TOTALS
             if len(plays_b) > 0:
                 st.markdown(section_title_html(f"🎯 ENGINE B — TOTALS ({current_window})", accent), unsafe_allow_html=True)
                 for _, row in plays_b.iterrows():
-                    direction = safe(row["engine_b_play_dir"], "—")
-                    total = safe(row["close_total"], safe(row["open_total"], "—"))
-                    tier = str(row["engine_b_tier"])
-                    play_line = f"{direction} {total} &nbsp;→&nbsp; {row['engine_b_units']}u"
+                    tier = str(row["engine_b_tier"]).upper()
+                    u = get_units_b(row)
+                    direction = safe(row.get("engine_b_play_dir", ""), "—")
+                    total = safe(row.get("close_total", ""), safe(row.get("open_total", ""), "—"))
+                    play_line = f"{direction} {total}"
                     flags_html = ""
-                    for f in safe(row["engine_b_flags_for"], "").split(","):
+                    for f in safe(row.get("engine_b_flags_for", ""), "").split(","):
                         if f.strip():
                             flags_html += f'<div><span style="color:#4caf50;">✅ {f.strip()}</span></div>'
-                    for f in safe(row["engine_b_flags_against"], "").split(","):
+                    for f in safe(row.get("engine_b_flags_against", ""), "").split(","):
                         if f.strip():
                             flags_html += f'<div><span style="color:#f44336;">❌ {f.strip()}</span></div>'
-                    kill = safe(row["engine_b_kill"], "")
+                    kill = safe(row.get("engine_b_kill", ""), "")
                     if kill:
                         flags_html += f'<div><span style="color:#f44336;">🔴 KILL: {kill}</span></div>'
-                    meta = f"Engine B {tier} +{row['engine_b_net_score']:.2f} &nbsp;|&nbsp; {row['game_time_hst']} &nbsp;|&nbsp; {safe(row['venue'], '')}"
+                    meta = f"Engine B {tier} +{row.get('engine_b_net_score', 0):.2f} &nbsp;|&nbsp; {safe(row['game_time_hst'], '—')} HST &nbsp;|&nbsp; {safe(row.get('venue', ''), 'TBD')}"
                     st.markdown(play_card_html(
-                        matchup=f"{row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}",
-                        time_venue=f"{row['game_time_hst']} · {safe(row['venue'], 'TBD')} · Total {total}",
+                        matchup=f"{safe(row['away_team'],'').split()[-1]} @ {safe(row['home_team'],'').split()[-1]}",
+                        time_venue=f"{safe(row['game_time_hst'],'—')} HST · {safe(row.get('venue',''),'TBD')} · Total {total}",
                         tier=tier, play_line=play_line,
-                        units=f"→ {row['engine_b_units']}u", meta=meta,
+                        units=f"→ {u}u", meta=meta,
                         flags_html=flags_html, accent=accent,
                     ), unsafe_allow_html=True)
 
@@ -687,14 +570,15 @@ def main():
             if len(killed) > 0:
                 st.markdown(section_title_html("🔴 KILLED PLAYS", "#f44336"), unsafe_allow_html=True)
                 for _, row in killed.iterrows():
+                    kill_reason = safe(row.get("engine_b_kill", ""), "—")
                     st.markdown(f"""
                     <div style="background:#12121f; border:1px solid #f4433640; border-radius:6px;
                          padding:10px 14px; margin-bottom:8px; font-family:'Share Tech Mono',monospace; font-size:0.8em;">
                       <span style="color:#f44336; font-family:'Orbitron',sans-serif; font-size:0.85em; font-weight:700;">
-                        {row['away_team'].split()[-1]} @ {row['home_team'].split()[-1]}
+                        {safe(row['away_team'],'').split()[-1]} @ {safe(row['home_team'],'').split()[-1]}
                       </span>
-                      <span style="color:#546e7a; margin-left:10px;">{row['game_time_hst']}</span>
-                      <span style="color:#f44336; margin-left:10px;">KILL: {safe(row['engine_b_kill'], '—')}</span>
+                      <span style="color:#546e7a; margin-left:10px;">{safe(row['game_time_hst'],'—')} HST</span>
+                      <span style="color:#f44336; margin-left:10px;">KILL: {kill_reason}</span>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -704,13 +588,13 @@ def main():
             for _, row in df_t.iterrows():
                 ea_score = row.get("engine_a_net_score", 0) or 0
                 eb_score = row.get("engine_b_net_score", 0) or 0
-                ea_tier = safe(row["engine_a_tier"], "PASS")
-                eb_tier = safe(row["engine_b_tier"], "PASS")
-                a_color = "#4caf50" if ea_tier not in ["PASS", "KILLED"] else ("#f44336" if ea_tier == "KILLED" else "#546e7a")
-                b_color = "#4caf50" if eb_tier not in ["PASS", "KILLED"] else ("#f44336" if eb_tier == "KILLED" else "#546e7a")
+                ea_tier = safe(row.get("engine_a_tier", ""), "PASS")
+                eb_tier = safe(row.get("engine_b_tier", ""), "PASS")
+                a_color = "#4caf50" if ea_tier in ("ELITE", "PLAY") else ("#f44336" if ea_tier == "KILLED" else "#546e7a")
+                b_color = "#4caf50" if eb_tier in ("ELITE", "PLAY") else ("#f44336" if eb_tier == "KILLED" else "#546e7a")
                 rows_html += f"""<tr style="border-bottom:1px solid #1a1a2e20;">
-                  <td style="padding:5px 10px; color:#fff; font-family:'Share Tech Mono',monospace; white-space:nowrap;">{safe(row['away_team'],'').split()[-1]} @ {safe(row['home_team'],'').split()[-1]}</td>
-                  <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace;">{safe(row['game_time_hst'],'—')}</td>
+                  <td style="padding:5px 10px; color:#fff; font-family:'Share Tech Mono',monospace; white-space:nowrap;">{safe(row.get('away_team',''),'').split()[-1]} @ {safe(row.get('home_team',''),'').split()[-1]}</td>
+                  <td style="padding:5px 10px; color:#546e7a; font-family:'Share Tech Mono',monospace;">{safe(row.get('game_time_hst',''),'—')}</td>
                   <td style="padding:5px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{fmt_ml(row.get('close_away_ml',''))} / {fmt_ml(row.get('close_home_ml',''))}</td>
                   <td style="padding:5px 10px; color:#888; font-family:'Share Tech Mono',monospace;">{safe(row.get('close_total',''),safe(row.get('open_total',''),'—'))}</td>
                   <td style="padding:5px 10px; color:{a_color}; font-family:'Orbitron',sans-serif; font-size:0.75em; font-weight:700;">{ea_tier} {ea_score:+.2f}</td>
@@ -722,7 +606,7 @@ def main():
             <table style="width:100%; border-collapse:collapse; font-size:0.78em;">
               <thead><tr style="background:#0d0d18;">
                 <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Game</th>
-                <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Time</th>
+                <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Time HST</th>
                 <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">ML (A/H)</th>
                 <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Total</th>
                 <th style="padding:6px 10px; text-align:left; color:#888; font-weight:400; text-transform:uppercase; font-size:0.7em; font-family:'Share Tech Mono',monospace;">Engine A</th>
@@ -735,9 +619,10 @@ def main():
             """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 2 — FULL SLATE
+    # TAB 1 — FULL SLATE
+    # v1.2: added weather_pressure_hpa column
     # ═══════════════════════════════════════════════════════
-    with tabs[2]:
+    with tabs[1]:
         if df_out is None:
             st.error("Daily Outlook not loaded.")
         else:
@@ -751,24 +636,27 @@ def main():
                 df_display = df_display[df_display["_window"] == "T1"]
             elif "T2" in w_filter:
                 df_display = df_display[df_display["_window"] == "T2"]
+
+            # v1.2: weather_pressure_hpa added after weather_wind (col 31)
             cols_show = [
                 "game_time_hst", "away_team", "home_team",
                 "away_starter", "home_starter",
                 "open_away_ml", "open_home_ml", "close_away_ml", "close_home_ml",
                 "open_total", "close_total", "total_change", "ml_fav_move_dir",
+                "weather_temp", "weather_wind", "weather_pressure_hpa",
+                "park_factor",
                 "engine_a_tier", "engine_a_net_score", "engine_a_play_side",
                 "engine_b_tier", "engine_b_net_score", "engine_b_play_dir",
                 "engine_a_flags_for", "engine_b_flags_for",
-                "weather_temp", "weather_wind", "park_factor",
             ]
             df_show = df_display[[c for c in cols_show if c in df_display.columns]].copy()
             df_show.columns = [c.replace("_", " ").upper() for c in df_show.columns]
             st.dataframe(df_show, use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 3 — SHARP MONEY
+    # TAB 2 — SHARP MONEY
     # ═══════════════════════════════════════════════════════
-    with tabs[3]:
+    with tabs[2]:
         if not trade_flows:
             st.markdown(alert_html("⚠️ NO TRADE FLOW DATA", f"No trade_flow_{today_str}_*.json found in Drive folder."), unsafe_allow_html=True)
         else:
@@ -790,7 +678,6 @@ def main():
                 if not sharp_markets:
                     st.markdown(no_plays_html("NO SHARP SIGNALS TRIGGERED"), unsafe_allow_html=True)
                     continue
-                from collections import defaultdict
                 by_type = defaultdict(list)
                 for m in sharp_markets:
                     by_type[m["market_type"]].append(m)
@@ -830,70 +717,9 @@ def main():
                     """, unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 4 — KALSHI DEPTH
+    # TAB 3 — GOD MODE
     # ═══════════════════════════════════════════════════════
-    with tabs[4]:
-        if kd_data is None:
-            st.markdown(alert_html("⚠️ NO KALSHI DEPTH DATA", f"No kalshi_depth_{today_str}_close/open.json found."), unsafe_allow_html=True)
-        else:
-            meta = kd_data.get("metadata", {})
-            games = kd_data.get("games", [])
-            st.markdown(kpi_html([
-                ("Games Captured", meta.get("games_captured", len(games)), "cyan"),
-                ("Snapshot", meta.get("phase", "—").upper(), "amber"),
-                ("Version", meta.get("script_version", "—"), "muted"),
-                ("Snapshot Time", meta.get("snapshot_time", "—")[:16].replace("T", " "), "muted"),
-                ("File", kd_file or "—", "muted"),
-            ]), unsafe_allow_html=True)
-            for game in games:
-                away = game.get("away_team", "—")
-                home = game.get("home_team", "—")
-                game_time = game.get("game_time_et", "—")
-                ml = game.get("moneyline", {})
-                spread = game.get("spread", {})
-                total = game.get("total", {})
-                rfi = game.get("rfi", {})
-                home_ml = ml.get("home", {})
-                away_ml = ml.get("away", {})
-                home_prob = home_ml.get("last_price", "—")
-                away_prob = away_ml.get("last_price", "—")
-                total_line = total.get("primary_line", "—")
-                total_over = total.get("yes_bid", "—")
-                spread_line = spread.get("primary_line", "—") if spread.get("available") else "N/A"
-                hp_str = f"{home_prob:.0%}" if isinstance(home_prob, float) else "—"
-                ap_str = f"{away_prob:.0%}" if isinstance(away_prob, float) else "—"
-                to_str = f"{total_over:.0%}" if isinstance(total_over, float) else "—"
-                tf_game = game.get("trade_flow", {})
-                ml_tf = tf_game.get("moneyline", {})
-                ml_sharp = ml_tf.get("sharp_signal", {})
-                sharp_triggered = ml_sharp.get("triggered", False)
-                sharp_dir = ml_sharp.get("direction", "—")
-                sharp_badge = ""
-                if sharp_triggered:
-                    sc = "#4caf50" if sharp_dir == "YES" else "#f44336"
-                    sharp_badge = f'<span style="background:rgba(76,175,80,0.15); border:1px solid {sc}; color:{sc}; padding:2px 8px; border-radius:3px; font-size:0.72em; font-family:\'Orbitron\',sans-serif; font-weight:700;">⚡ SHARP {sharp_dir}</span>'
-                st.markdown(f"""
-                <div style="background:#12121f; border:1px solid #1a1a2e; border-radius:8px;
-                     padding:10px 16px; margin-bottom:8px; font-family:'Share Tech Mono',monospace;">
-                  <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px;">
-                    <span style="font-family:'Orbitron',sans-serif; font-size:1.0em; font-weight:700; color:#fff;">{away} @ {home}</span>
-                    <span style="color:#546e7a; font-size:0.75em;">{game_time} ET</span>
-                    {sharp_badge}
-                  </div>
-                  <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:8px; font-size:0.76em;">
-                    <div><div style="color:#888; font-size:0.75em; text-transform:uppercase; margin-bottom:2px;">ML {away}</div><div style="color:#00e5ff;">{ap_str}</div></div>
-                    <div><div style="color:#888; font-size:0.75em; text-transform:uppercase; margin-bottom:2px;">ML {home}</div><div style="color:#00e5ff;">{hp_str}</div></div>
-                    <div><div style="color:#888; font-size:0.75em; text-transform:uppercase; margin-bottom:2px;">Spread</div><div style="color:#888;">{home} {spread_line}</div></div>
-                    <div><div style="color:#888; font-size:0.75em; text-transform:uppercase; margin-bottom:2px;">Total O {total_line}</div><div style="color:#888;">{to_str}</div></div>
-                    <div><div style="color:#888; font-size:0.75em; text-transform:uppercase; margin-bottom:2px;">RFI Yes</div><div style="color:#888;">{f"{rfi['yes_bid']:.0%}" if rfi.get("available") and isinstance(rfi.get("yes_bid"), float) else "N/A"}</div></div>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-    # ═══════════════════════════════════════════════════════
-    # TAB 5 — GOD MODE
-    # ═══════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[3]:
         if gm_data is None:
             st.markdown(alert_html("⚠️ GOD MODE NOT LOADED", f"No MLB_God_Mode_{today_str}*.xlsx found in Drive folder."), unsafe_allow_html=True)
         else:
@@ -904,48 +730,9 @@ def main():
                     st.dataframe(gm_data[sname], use_container_width=True, height=500)
 
     # ═══════════════════════════════════════════════════════
-    # TAB 6 — WX PRESSURE
+    # TAB 4 — FUTURES
     # ═══════════════════════════════════════════════════════
-    with tabs[6]:
-        if px_data is None:
-            st.markdown(alert_html("⚠️ NO PRESSURE DATA", f"No game_day_pressure_{today_str}.json found."), unsafe_allow_html=True)
-        else:
-            summary = px_data.get("summary", {})
-            st.markdown(kpi_html([
-                ("Hitter Boost", summary.get("hitter_boost", 0), "green"),
-                ("Pitcher Boost", summary.get("pitcher_boost", 0), "red"),
-                ("Neutral", summary.get("neutral", 0), "muted"),
-                ("Dome Skip", summary.get("dome_skip", 0), "muted"),
-                ("Errors", summary.get("errors", 0), "red" if summary.get("errors", 0) > 0 else "muted"),
-            ]), unsafe_allow_html=True)
-            for r in px_data.get("results", []):
-                team = r.get("team", "—")
-                park = r.get("park", "—")
-                classification = r.get("classification", "NEUTRAL")
-                anomaly = r.get("anomaly_hpa", 0)
-                sigma = r.get("anomaly_sigma", 0)
-                avg_hpa = r.get("game_window_avg_hpa", 0)
-                cls_color = {"HITTER_BOOST": "#4caf50", "PITCHER_BOOST": "#f44336", "NEUTRAL": "#546e7a"}.get(classification, "#546e7a")
-                roof = r.get("roof_warning", "")
-                st.markdown(f"""
-                <div style="background:#12121f; border:1px solid #1a1a2e; border-radius:6px;
-                     padding:8px 14px; margin-bottom:6px; font-family:'Share Tech Mono',monospace; font-size:0.78em;
-                     display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-                  <span style="font-family:'Orbitron',sans-serif; font-size:0.9em; font-weight:700; color:#fff; min-width:50px;">{team}</span>
-                  <span style="color:#888;">{park}</span>
-                  <span style="font-family:'Orbitron',sans-serif; font-size:0.7em; font-weight:700; color:{cls_color};
-                       padding:2px 8px; border:1px solid {cls_color}40; border-radius:4px;">{classification}</span>
-                  <span style="color:#888;">Anomaly: <span style="color:#00e5ff;">{anomaly:+.2f} hPa</span></span>
-                  <span style="color:#888;">σ: {sigma:.2f}</span>
-                  <span style="color:#888;">Avg: {avg_hpa:.1f} hPa</span>
-                  {"<span style='color:#ffab00; font-size:0.72em;'>⚠️ RETRACTABLE</span>" if "RETRACTABLE" in roof else ""}
-                </div>
-                """, unsafe_allow_html=True)
-
-    # ═══════════════════════════════════════════════════════
-    # TAB 7 — FUTURES
-    # ═══════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[4]:
         if not futures_file_id:
             st.markdown(alert_html("⚠️ FUTURES TRACKER NOT FOUND", "MLB_Futures_Tracker.xlsx not found in Drive folder."), unsafe_allow_html=True)
         else:
@@ -993,7 +780,7 @@ def main():
     st.markdown(f"""
     <div style="text-align:center; margin-top:30px; padding-top:16px; border-top:1px solid #1a1a2e;
          font-size:0.7em; color:#546e7a; font-family:'Share Tech Mono',monospace;">
-      MLB Flag Finder &nbsp;|&nbsp; Play Card &nbsp;|&nbsp; {today_str} {current_window}<br>
+      MLB Flag Finder v1.2 &nbsp;|&nbsp; Play Card &nbsp;|&nbsp; {today_str} {current_window}<br>
       Data: Google Drive / {DRIVE_FOLDER_NAME} &nbsp;|&nbsp; Outlook: {loaded_sheet or '—'} &nbsp;|&nbsp; Trade Flow: {tf_file or '—'}<br>
       For internal use only. Not financial advice.
     </div>
